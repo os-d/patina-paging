@@ -523,6 +523,10 @@ impl<P: PageAllocator, Arch: PageTableHal> PageTableInternal<P, Arch> {
             entry.entry_ptr_address()
         );
 
+        if va.into() == 0x10000000000 {
+            unsafe { core::arch::asm!("int3") };
+        }
+
         let next_level = level.next_level().ok_or_else(|| {
             log::error!("Failed to split large page at VA {:#x?} as this is the lowest level", va);
             PtError::InvalidParameter
