@@ -223,51 +223,40 @@ impl crate::arch::PageTableEntry for PageTableEntryX64 {
     }
 
     fn dump_entry(&self, va: VirtualAddress, level: PageLevel) -> Result<(), PtError> {
-        let nx = self.nx() as u64;
-        let available_high = self.available_high() as u64;
-        let page_table_base_address = self.page_table_base_address();
-        let available = self.available() as u64;
-        let global = self.global() as u64;
-        let pat = self.page_size() as u64;
-        let dirty = self.dirty() as u64;
-        let accessed = self.accessed() as u64;
-        let cache_disabled = self.cache_disabled() as u64;
-        let write_through = self.write_through() as u64;
-        let user_supervisor = self.user_supervisor() as u64;
-        let read_write = self.read_write() as u64;
-        let present = self.present() as u64;
-        let depth = 2 * level.depth();
-        let inv_depth = 8 - depth;
         let level_name = match level {
-            PT => "PT",
-            PD => "PD",
-            PDP => "PDP",
-            PML4 => "PML4",
-            PML5 => "PML5",
+            PT => "Pte ",
+            PD => "Pde ",
+            PDP => "Ppe ",
+            PML4 => "Pxe ",
+            PML5 => "Pxe5",
         };
+        let indent = 2 * level.depth() + 1;
+        let large_page = matches!(level, PD | PDP) && self.page_size();
+
+        if large_page {
+            let size = if level == PD { "2MB Large Page" } else { "1GB Huge Page" };
+            log::info!("{:indent$}{}", "", size, indent = indent);
+        }
 
         log::info!(
-            "{:6}|{:depth$}[{} {}]{:inv_depth$}|{:01b}|{:011b}|{:040b}|{:03b}|{:01b}|{:01b}|{:01b}|{:01b}|{:01b}|{:01b}|{:01b}|{:01b}|{:01b}|",
+            "{:indent$}{} @ {:#X} Contains {:016X}  {}{}{}{}{}{}{}{}{}{}  [{:#X} - {:#X}]",
+            "",
             level_name,
-            "",
-            va,
-            ((va + level.entry_va_size())? - 1)?,
-            "",
-            nx,                      // 1 bit -  0 = Execute Code, 1 = No Code Execution
-            available_high & 0x7FF,  // 11 bits -  Available for use by system software
-            page_table_base_address, // 40 bits -  Page Table Base Address
-            available & 0x7,         // 3 bits -  Available for use by system software
-            global,                  // 1 bit -  0 = Not global page, 1 = global page TLB not cleared on CR3 write
-            pat,                     // 1 bit
-            dirty,                   // 1 bit -  0 = Not Dirty, 1 = written by processor on access to page
-            accessed,                // 1 bit -  0 = Not accessed, 1 = Accessed (set by CPU)
-            cache_disabled,          // 1 bit -  0 = Cached, 1=Non-Cached
-            write_through,           // 1 bit -  0 = Write-Back caching, 1=Write-Through caching
-            user_supervisor,         // 1 bit -  0 = Supervisor, 1=User
-            read_write,              // 1 bit -  0 = Read-Only, 1= Read/Write
-            present,                 // 1 bit -  0 = Not present in memory, 1 = Present in memory
-            depth = depth,
-            inv_depth = inv_depth,
+            self.entry_ptr_address(),
+            self.0,
+            if self.global() { 'G' } else { '-' },
+            if large_page { 'L' } else { '-' },
+            if self.dirty() { 'D' } else { '-' },
+            if self.accessed() { 'A' } else { '-' },
+            if self.cache_disabled() { 'N' } else { '-' },
+            if self.write_through() { 'T' } else { '-' },
+            if self.user_supervisor() { 'U' } else { 'K' },
+            if self.read_write() { 'W' } else { 'R' },
+            if self.nx() { '-' } else { 'E' },
+            if self.present() { 'V' } else { '-' },
+            u64::from(va),
+            u64::from(va.round_up(level)),
+            indent = indent,
         );
 
         Ok(())
@@ -275,22 +264,7 @@ impl crate::arch::PageTableEntry for PageTableEntryX64 {
 
     fn dump_entry_header() {
         log::info!(
-            "------------------------------------------------------------------------------------------------------------------------------------"
-        );
-        log::info!(
-            "                                                      63 62       52 51                                   12 11 9 8 7 6 5 4 3 2 1 0 "
-        );
-        log::info!(
-            "                                                      |N|           |                                        |   |M|P|I| |P|P|U|R| |"
-        );
-        log::info!(
-            "                                                      |X| Available |     Page-Map Level-4 Base Address      |AVL|B|G|G|A|C|W|/|/|P|"
-        );
-        log::info!(
-            "                                                      | |           |                                        |   |Z|S|N| |D|T|S|W| |"
-        );
-        log::info!(
-            "------------------------------------------------------------------------------------------------------------------------------------"
+            "Flags: G=Global L=Large/Huge page D=Dirty A=Accessed N=Cache disabled T=Write through U=User/K=Kernel W=Writable/R=Read only E=Executable V=Valid"
         );
     }
 
