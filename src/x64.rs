@@ -15,7 +15,7 @@ mod structs;
 #[cfg_attr(coverage, coverage(off))]
 mod tests;
 
-use structs::{CR3_PAGE_BASE_ADDRESS_MASK, MAX_VA_4_LEVEL, MAX_VA_5_LEVEL, ZERO_VA_4_LEVEL, ZERO_VA_5_LEVEL};
+use structs::{CR3_PAGE_BASE_ADDRESS_MASK, MAX_VA, MAX_VA_4_LEVEL, MAX_VA_5_LEVEL, ZERO_VA_4_LEVEL, ZERO_VA_5_LEVEL};
 
 use crate::{
     MappedRegion, MemoryAttributes, PageTable, PagingType, PtError,
@@ -110,12 +110,12 @@ impl<P: PageAllocator> PageTable for X64PageTable<P> {
         size: u64,
         attributes: crate::MemoryAttributes,
     ) -> Result<(), PtError> {
-        check_canonical_range(address, size, self.internal.paging_type)?;
+        check_mappable_range(address, size, self.internal.paging_type)?;
         self.internal.map_memory_region(address, size, attributes)
     }
 
     fn unmap_memory_region(&mut self, address: u64, size: u64) -> Result<(), PtError> {
-        check_canonical_range(address, size, self.internal.paging_type)?;
+        check_mappable_range(address, size, self.internal.paging_type)?;
         self.internal.unmap_memory_region(address, size)
     }
 
@@ -389,8 +389,8 @@ fn detect_paging_type() -> Result<PagingType, PtError> {
     if read_cr4() & CR4_LA57 != 0 { Ok(PagingType::Paging5Level) } else { Ok(PagingType::Paging4Level) }
 }
 
-/// Checks if the given address is canonical.
-fn check_canonical_range(address: u64, size: u64, paging_type: PagingType) -> Result<(), PtError> {
+/// Checks that the given range is canonical for the paging type, returning the last address in the range.
+fn check_canonical_range(address: u64, size: u64, paging_type: PagingType) -> Result<u64, PtError> {
     // For a canonical address, the bits 63 though the max bit supported by the
     // paging type must be all 0s or all 1s. Get the mask for this range.
     let max_bit = paging_type.linear_address_bits() - 1;
@@ -404,6 +404,26 @@ fn check_canonical_range(address: u64, size: u64, paging_type: PagingType) -> Re
     let size = size.checked_sub(1).ok_or(crate::PtError::InvalidMemoryRange)?;
     let end_address = address.checked_add(size).ok_or(crate::PtError::InvalidMemoryRange)?;
     if (end_address & mask) != (address & mask) {
+        return Err(crate::PtError::InvalidMemoryRange);
+    }
+
+    Ok(end_address)
+}
+
+/// Checks that the given range is canonical and lies within the virtual address space this crate supports mapping.
+///
+/// Mappings are restricted to [`MAX_VA`] so that a canonical address always maps to the physical address formed by
+/// dropping the sign-extension bits. The limit is applied to the effective linear address, i.e. the address with the
+/// sign-extension bits removed, which is what allows a canonical higher-half VA (such as a TDX shared-bit address
+/// under 4-level paging) to be mapped while rejecting a canonical VA that genuinely exceeds 48 bits (which can only
+/// happen under 5-level paging).
+fn check_mappable_range(address: u64, size: u64, paging_type: PagingType) -> Result<(), PtError> {
+    let end_address = check_canonical_range(address, size, paging_type)?;
+
+    // The end address shares its sign-extension bits with the start address and is therefore always the larger
+    // effective address of the two, so it is the only one that needs to be checked.
+    let linear_mask = !(u64::MAX << paging_type.linear_address_bits());
+    if (end_address & linear_mask) > MAX_VA {
         return Err(crate::PtError::InvalidMemoryRange);
     }
 

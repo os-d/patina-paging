@@ -84,7 +84,7 @@ impl TestPageAllocator {
     //  TestPageAllocator                         Page Tables
     //       Memory
     //
-    pub fn validate_pages<Arch: PageTableHal>(&self, address: u64, size: u64, attributes: MemoryAttributes) {
+    pub fn validate_pages<Arch: PageTableHal + 'static>(&self, address: u64, size: u64, attributes: MemoryAttributes) {
         log::info!("Validating pages from {:#x} to {:#x}", address, address + size);
         let address = VirtualAddress::new(address);
         let start_va = address;
@@ -187,7 +187,8 @@ impl TestPageAllocator {
         );
 
         if leaf {
-            assert_eq!(page_base, virtual_address);
+            // We restrict to 48 bit VAs
+            assert_eq!(page_base, virtual_address & 0x0000_FFFF_FFFF_F000);
             assert_eq!(attributes, expected_attributes);
         } else {
             assert_eq!(page_base, next_page_table_address);

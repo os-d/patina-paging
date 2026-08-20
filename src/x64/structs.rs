@@ -16,8 +16,15 @@ use crate::{
 use bitfield_struct::bitfield;
 use core::ptr::write_volatile;
 
-// The following definitions are the maximum virtual address for each level of the page table hierarchy. These are
-// above the range generally supported by processors, but we only care that our zero VA and self-map aren't overwritten
+// Because we identity map (mostly) we limit the virtual address space to 48 bits. We are already restricted to
+// the physical address width (which the crate assumes is 52 for x64). The crate has assumptions for TDX that
+// canonical VAs with the shared bit set are supposed to be mapped to the same address without the canonical bits set.
+// This limit is applied to the effective linear address, i.e. the address with the canonical sign-extension bits
+// removed, so that a canonical high-half VA maps to the physical address formed by dropping those bits.
+pub(crate) const MAX_VA: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+// The following definitions are the maximum raw virtual address for each paging type. These are above the range
+// generally supported by processors, but we only care that our zero VA and self-map aren't overwritten.
 pub(crate) const MAX_VA_5_LEVEL: u64 = 0xFFFD_FFFF_FFFF_FFFF;
 pub(crate) const MAX_VA_4_LEVEL: u64 = 0xFFFF_FEFF_FFFF_FFFF;
 
@@ -45,7 +52,14 @@ pub(crate) const FOUR_LEVEL_PT_SELF_MAP_BASE: u64 = 0xFFFF_FF80_0000_0000;
 pub(crate) const CR3_PAGE_BASE_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000; // 40 bit - lower 12 bits for alignment
 
 pub(crate) const PAGE_TABLE_ENTRY_4KB_PAGE_TABLE_BASE_ADDRESS_SHIFT: u64 = 12u64; // lower 12 bits for alignment
-pub(crate) const PAGE_TABLE_ENTRY_4KB_PAGE_TABLE_BASE_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000; // 40 bit - lower 12 bits for alignment
+
+// 4 level page tables can address up to 48 bits of virtual address space. 5 level page tables can address up
+// to 57 bits of virtual address space. However, we are identity mapped (mostly), so we are limited to the physical
+// address width as well. For now, we will limit the virtual address space to 48 bits. This ensures that no matter
+// the level of page table, we are not exceeding the maximum VA. This allows usecases such as TDX to work where the
+// shared bit is set, forcing a canonical VA that needs to be mapped to a physical address with the canonical bits
+// masked off.
+pub(crate) const VA_ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 #[rustfmt::skip]
 #[bitfield(u64)]
@@ -156,7 +170,7 @@ impl crate::arch::PageTableEntry for PageTableEntryX64 {
 
         let mut next_level_table_base: u64 = pa.into();
 
-        next_level_table_base &= PAGE_TABLE_ENTRY_4KB_PAGE_TABLE_BASE_ADDRESS_MASK;
+        next_level_table_base &= VA_ADDRESS_MASK;
         next_level_table_base >>= PAGE_TABLE_ENTRY_4KB_PAGE_TABLE_BASE_ADDRESS_SHIFT;
 
         copy.set_page_table_base_address(next_level_table_base);

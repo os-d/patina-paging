@@ -272,6 +272,197 @@ fn test_map_memory_address_simple() {
 }
 
 #[test]
+fn test_map_memory_address_high() {
+    let address = 0xFFFF800000000000;
+    let size = 0x6000;
+
+    #[allow(unused)]
+    type Arch = PageTableArchX64;
+    type PageTableType = X64PageTable<TestPageAllocator>;
+    #[allow(unused)]
+    type PageTableTypeStub = X64PageTable<PageAllocatorStub>;
+    let paging_type = PagingType::Paging4Level;
+
+    let num_pages = num_page_tables_required::<Arch>(address, size, paging_type).unwrap();
+
+    let page_allocator = TestPageAllocator::new(num_pages, paging_type);
+    let pt = PageTableType::new(page_allocator.clone(), paging_type);
+
+    assert!(pt.is_ok());
+    let mut pt = pt.unwrap();
+
+    let attributes = Arch::DEFAULT_ATTRIBUTES | MemoryAttributes::ReadOnly;
+    let res = pt.map_memory_region(address, size, attributes);
+
+    assert!(res.is_ok());
+
+    assert_eq!(page_allocator.pages_allocated(), num_pages);
+
+    page_allocator.validate_pages::<Arch>(address, size, attributes);
+}
+
+/// The physical address a canonical VA is expected to be identity mapped to, i.e. the VA with the
+/// canonical sign-extension bits dropped.
+const X64_VA_TO_PA_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+/// x64 restricts mappings to a 48-bit VA space, so a canonical address must map to the physical address
+/// formed by dropping the canonical sign-extension bits. This is what allows a TDX shared-bit address,
+/// which is canonical higher-half under 4-level paging, to be identity mapped to the shared GPA.
+#[test]
+fn test_x64_canonical_va_maps_to_pa_without_canonical_bits() {
+    let cases = [
+        // 4-level, lower half.
+        (PagingType::Paging4Level, 0x0000_0000_0020_0000u64),
+        // 4-level, last 2MB page of the canonical lower half.
+        (PagingType::Paging4Level, 0x0000_7FFF_FFE0_0000u64),
+        // 4-level, first canonical higher-half address, i.e. bit 47 (the TDX shared bit) set.
+        (PagingType::Paging4Level, 0xFFFF_8000_0000_0000u64),
+        // 4-level, higher half, below the root entries reserved for the zero VA and the self map.
+        (PagingType::Paging4Level, 0xFFFF_FE00_0000_0000u64),
+        // 5-level, lower half.
+        (PagingType::Paging5Level, 0x0000_0000_0020_0000u64),
+        // 5-level, last 2MB page of the supported 48-bit VA space.
+        (PagingType::Paging5Level, 0x0000_FFFF_FFE0_0000u64),
+    ];
+
+    let size = SIZE_2MB;
+    let attributes = MemoryAttributes::ReadOnly;
+
+    for (paging_type, address) in cases {
+        let num_pages = num_page_tables_required::<PageTableArchX64>(address, size, paging_type).unwrap();
+        let page_allocator = TestPageAllocator::new(num_pages, paging_type);
+        let mut pt = X64PageTable::new(page_allocator.clone(), paging_type).unwrap();
+
+        pt.map_memory_region(address, size, attributes)
+            .unwrap_or_else(|e| panic!("{paging_type:?} {address:#x} should be mappable, got {e:?}"));
+
+        assert_eq!(pt.query_memory_region(address, size), Ok(attributes));
+
+        let mut mapped = 0;
+        for region in pt.iter_mapped_regions(None) {
+            assert_eq!(
+                region.pa,
+                region.va & X64_VA_TO_PA_MASK,
+                "{paging_type:?} {address:#x} must map to the VA without the canonical bits, got {region:#x?}"
+            );
+            mapped += region.size;
+        }
+        assert_eq!(mapped, size, "{paging_type:?} {address:#x} must be fully mapped");
+
+        // Also walks the tables directly, which asserts the leaf PA is the VA masked to 48 bits.
+        page_allocator.validate_pages::<PageTableArchX64>(address, size, attributes);
+    }
+}
+
+/// A VA above 48 bits is only usable if it is canonical for the paging type. Non-canonical addresses
+/// must be rejected by every operation.
+#[test]
+fn test_x64_rejects_non_canonical_va() {
+    let cases = [
+        // 4-level canonical addresses sign extend bit 47 through bit 63.
+        (PagingType::Paging4Level, 0x0000_8000_0000_0000u64),
+        (PagingType::Paging4Level, 0x0000_FFFF_FFFF_F000u64),
+        (PagingType::Paging4Level, 0x0001_0000_0000_0000u64),
+        (PagingType::Paging4Level, 0x7FFF_8000_0000_0000u64),
+        (PagingType::Paging4Level, 0xFFFE_0000_0000_0000u64),
+        // 5-level canonical addresses sign extend bit 56 through bit 63.
+        (PagingType::Paging5Level, 0x0100_0000_0000_0000u64),
+        (PagingType::Paging5Level, 0x0200_0000_0000_0000u64),
+        (PagingType::Paging5Level, 0xFE00_0000_0000_0000u64),
+    ];
+
+    let size = PAGE_SIZE;
+    let attributes = MemoryAttributes::ReadOnly;
+
+    for (paging_type, address) in cases {
+        let page_allocator = TestPageAllocator::new(16, paging_type);
+        let mut pt = X64PageTable::new(page_allocator, paging_type).unwrap();
+
+        assert_eq!(
+            pt.map_memory_region(address, size, attributes),
+            Err(PtError::InvalidParameter),
+            "{paging_type:?} {address:#x} is not canonical and must not be mappable"
+        );
+        assert_eq!(pt.unmap_memory_region(address, size), Err(PtError::InvalidParameter));
+        assert_eq!(pt.query_memory_region(address, size), Err(PtError::InvalidParameter));
+    }
+}
+
+/// A VA can be canonical for the paging type and still exceed the 48-bit VA space this crate supports.
+/// Such addresses cannot be identity mapped, because dropping the canonical bits would alias a
+/// different address, so they must be rejected.
+#[test]
+fn test_x64_rejects_canonical_va_above_max_supported_va() {
+    let cases = [
+        // 5-level canonical lower-half addresses that need more than 48 bits.
+        (PagingType::Paging5Level, 0x0001_0000_0000_0000u64, PAGE_SIZE),
+        (PagingType::Paging5Level, 0x00FF_FFFF_FFFF_F000u64, PAGE_SIZE),
+        // 5-level canonical higher-half addresses are always above 48 bits once sign extension is
+        // removed, unlike 4-level where the higher half folds back into the 48-bit space.
+        (PagingType::Paging5Level, 0xFFFF_8000_0000_0000u64, PAGE_SIZE),
+        (PagingType::Paging5Level, 0xFFFF_FFFF_FFFF_F000u64, PAGE_SIZE),
+        // 4-level canonical higher-half address inside the root entries reserved for the zero VA and
+        // the self map.
+        (PagingType::Paging4Level, 0xFFFF_FF00_0000_0000u64, PAGE_SIZE),
+        // Ranges that start within the supported space but run past the end of it.
+        (PagingType::Paging5Level, 0x0000_FFFF_FFFF_F000u64, 2 * PAGE_SIZE),
+        (PagingType::Paging4Level, 0x0000_7FFF_FFFF_F000u64, 2 * PAGE_SIZE),
+        (PagingType::Paging4Level, 0xFFFF_FFFF_FFFF_F000u64, 2 * PAGE_SIZE),
+    ];
+
+    let attributes = MemoryAttributes::ReadOnly;
+
+    for (paging_type, address, size) in cases {
+        let page_allocator = TestPageAllocator::new(16, paging_type);
+        let mut pt = X64PageTable::new(page_allocator, paging_type).unwrap();
+
+        assert_eq!(
+            pt.map_memory_region(address, size, attributes),
+            Err(PtError::InvalidMemoryRange),
+            "{paging_type:?} {address:#x} size {size:#x} exceeds the supported VA space and must not be mappable"
+        );
+        assert_eq!(pt.unmap_memory_region(address, size), Err(PtError::InvalidMemoryRange));
+    }
+}
+
+/// The last page of the supported 48-bit VA space is mappable for both paging types, and the next page
+/// is not.
+#[test]
+fn test_x64_maps_last_supported_va_page() {
+    // 4-level tops out at the last canonical lower-half page, 5-level at the last page of the 48-bit
+    // VA space the crate supports.
+    let cases = [
+        (PagingType::Paging4Level, 0x0000_7FFF_FFFF_F000u64, 0x0000_8000_0000_0000u64),
+        (PagingType::Paging5Level, 0x0000_FFFF_FFFF_F000u64, 0x0001_0000_0000_0000u64),
+    ];
+
+    let size = PAGE_SIZE;
+    let attributes = MemoryAttributes::ReadOnly;
+
+    for (paging_type, last_page, past_end) in cases {
+        let num_pages = num_page_tables_required::<PageTableArchX64>(last_page, size, paging_type).unwrap();
+        let page_allocator = TestPageAllocator::new(num_pages, paging_type);
+        let mut pt = X64PageTable::new(page_allocator.clone(), paging_type).unwrap();
+
+        pt.map_memory_region(last_page, size, attributes)
+            .unwrap_or_else(|e| panic!("{paging_type:?} {last_page:#x} should be mappable, got {e:?}"));
+        assert_eq!(pt.query_memory_region(last_page, size), Ok(attributes));
+
+        let regions: Vec<_> = pt.iter_mapped_regions(None).collect();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].va, last_page);
+        assert_eq!(regions[0].pa, last_page & X64_VA_TO_PA_MASK);
+
+        assert!(
+            pt.map_memory_region(past_end, size, attributes).is_err(),
+            "{paging_type:?} {past_end:#x} is past the supported VA space and must not be mappable"
+        );
+
+        page_allocator.validate_pages::<PageTableArchX64>(last_page, size, attributes);
+    }
+}
+
+#[test]
 fn test_map_memory_address_0_to_ffff_ffff() {
     let address = 0;
 
@@ -1609,10 +1800,10 @@ fn test_iter_mapped_regions_multiple_disjoint() {
 fn test_iter_mapped_regions_canonicalizes_high_half() {
     // Mapping in the higher half forces the iterator to sign-extend the
     // additively-computed virtual address back into canonical form. x64
-    // 5-level paging is used because it cleanly supports a higher-half identity
-    // mapping at this base.
-    let paging_type = PagingType::Paging5Level;
-    let address = 0xFF00_0000_0000_0000u64;
+    // 4-level paging is used because a canonical higher-half VA still fits in
+    // the 48-bit VA space the crate supports mapping.
+    let paging_type = PagingType::Paging4Level;
+    let address = 0xFFFF_8000_0000_0000u64;
     let size = SIZE_2MB;
 
     let num_pages = num_page_tables_required::<PageTableArchX64>(address, size, paging_type).unwrap();
@@ -1797,9 +1988,10 @@ fn test_iter_mapped_regions_start_after_all_mappings_is_empty() {
 #[test]
 fn test_iter_mapped_regions_start_address_high_half() {
     // A canonical higher-half start address must be normalized so the higher-half mapping is still
-    // located and reported. x64 5-level paging cleanly supports a higher-half identity mapping here.
-    let paging_type = PagingType::Paging5Level;
-    let address = 0xFF00_0000_0000_0000u64;
+    // located and reported. x64 4-level paging is used because a canonical higher-half VA still fits
+    // in the 48-bit VA space the crate supports mapping.
+    let paging_type = PagingType::Paging4Level;
+    let address = 0xFFFF_8000_0000_0000u64;
     let size = SIZE_2MB;
 
     let num_pages = num_page_tables_required::<PageTableArchX64>(address, size, paging_type).unwrap();
